@@ -15,13 +15,22 @@ func main() {
 
 	fmt.Println("Server started on port 6379")
 
-	conn, err := l.Accept()
-	if err != nil {
-		fmt.Println("Error accepting connection: ", err.Error())
-		os.Exit(1)
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			fmt.Println("Error accepting connection: ", err.Error())
+			os.Exit(1)
+		}
+
+		go handleConn(conn)
 	}
+}
+
+func handleConn(conn net.Conn) {
+	defer conn.Close()
 
 	buf := make([]byte, 1024)
+	conn.Read(buf)
 
 	conn.Write([]byte("+PONG\r\n"))
 }

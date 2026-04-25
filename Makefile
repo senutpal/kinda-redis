@@ -8,7 +8,7 @@ GOCMD := $(GO)
 .PHONY: build run test fmt clean lint tidy
 
 build: $(BIN_DIR)
-	@$(GOCMD) build -o $(BIN) src/main.go
+	@$(GOCMD) build -o $(BIN) src/server/tcp.go
 
 $(BIN_DIR):
 	@mkdir -p $(BIN_DIR)

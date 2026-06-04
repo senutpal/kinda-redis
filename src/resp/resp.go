@@ -1,0 +1,404 @@
+package resp
+
+import (
+	"fmt"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+type Type byte
+
+const (
+	Integer = ':'
+	String  = '+'
+	Bulk    = '$'
+	Array   = '*'
+	Error   = '-'
+)
+
+type RESP struct {
+	Type  Type
+	Raw   []byte
+	Data  []byte
+	Count int
+}
+
+func (r RESP) ForEach(iter func(resp RESP) bool) {
+	data := r.Data
+	for i := 0; i < r.Count; i++ {
+		n, resp := ReadNextRESP(data)
+		if !iter(resp) {
+			return
+		}
+		data = data[n:]
+	}
+}
+
+func (r RESP) Bytes() []byte {
+	return r.Data
+}
+
+func (r RESP) String() string {
+	return string(r.Data)
+}
+
+func (r RESP) Int() int64 {
+	x, _ := strconv.ParseInt(r.String(), 10, 64)
+	return x
+}
+
+func (r RESP) Float() float64 {
+	x, _ := strconv.ParseFloat(r.String(), 10)
+	return x
+}
+
+func (r RESP) Map() map[string]RESP {
+	if r.Type != Array {
+		return nil
+	}
+	var n int
+	var key string
+	m := make(map[string]RESP)
+	r.ForEach(func(resp RESP) bool {
+		if n&1 == 0 {
+			key = resp.String()
+		} else {
+			m[key] = resp
+		}
+		n++
+		return true
+	})
+	return m
+}
+
+func (r RESP) MapGet(key string) RESP {
+	if r.Type != Array {
+		return RESP{}
+	}
+	var val RESP
+	var n int
+	var ok bool
+	r.ForEach(func(resp RESP) bool {
+		if n&1 == 0 {
+			ok = resp.String() == key
+		} else if ok {
+			val = resp
+			return false
+		}
+		n++
+		return true
+	})
+	return val
+}
+
+func (r RESP) Exists() bool {
+	return r.Type != 0
+}
+
+func ReadNextRESP(b []byte) (n int, resp RESP) {
+	if len(b) == 0 {
+		return 0, RESP{}
+	}
+	resp.Type = Type(b[0])
+	switch resp.Type {
+	case Integer, String, Bulk, Array, Error:
+	default:
+		return 0, RESP{}
+	}
+	i := 1
+	for ; ; i++ {
+		if i == len(b) {
+			return 0, RESP{}
+		}
+		if b[i] == '\n' {
+			if b[i-1] != '\r' {
+				return 0, RESP{}
+			}
+			i++
+			break
+		}
+	}
+	resp.Raw = b[0:i]
+	resp.Data = b[1 : i-2]
+	if resp.Type == Integer {
+		if len(resp.Data) == 0 {
+			return 0, RESP{}
+		}
+		var j int
+		if resp.Data[0] == '-' {
+			if len(resp.Data) == 1 {
+				return 0, RESP{}
+			}
+			j++
+		}
+		for ; j < len(resp.Data); j++ {
+			if resp.Data[j] < '0' || resp.Data[j] > '9' {
+				return 0, RESP{}
+			}
+		}
+		return len(resp.Raw), resp
+	}
+	if resp.Type == String || resp.Type == Error {
+		return len(resp.Raw), resp
+	}
+	var err error
+	resp.Count, err = strconv.Atoi(string(resp.Data))
+	if resp.Type == Bulk {
+		if err != nil {
+			return 0, RESP{}
+		}
+		if resp.Count < 0 {
+			resp.Data = nil
+			resp.Count = 0
+			return len(resp.Raw), resp
+		}
+		if len(b) < i+resp.Count+2 {
+			return 0, RESP{}
+		}
+		if b[i+resp.Count] != '\r' || b[i+resp.Count+1] != '\n' {
+			return 0, RESP{}
+		}
+		resp.Data = b[i : i+resp.Count]
+		resp.Raw = b[0 : i+resp.Count+2]
+		resp.Count = 0
+		return len(resp.Raw), resp
+	}
+	if err != nil {
+		return 0, RESP{}
+	}
+	var tn int
+	sdata := b[i:]
+	for j := 0; j < resp.Count; j++ {
+		rn, rresp := ReadNextRESP(sdata)
+		if rresp.Type == 0 {
+			return 0, RESP{}
+		}
+		tn += rn
+		sdata = sdata[rn:]
+	}
+	resp.Data = b[i : i+tn]
+	resp.Raw = b[0 : i+tn]
+	return len(resp.Raw), resp
+}
+
+type Kind int
+
+const (
+	Redis Kind = iota
+	Tile38
+	Telnet
+)
+
+func appendPrefix(b []byte, c byte, n int64) []byte {
+	if n >= 0 && n <= 9 {
+		return append(b, c, byte('0'+n), '\r', '\n')
+	}
+	b = append(b, c)
+	b = strconv.AppendInt(b, n, 10)
+	return append(b, '\r', '\n')
+}
+
+func AppendUint(b []byte, n uint64) []byte {
+	b = append(b, ':')
+	b = strconv.AppendUint(b, n, 10)
+	return append(b, '\r', '\n')
+}
+
+func AppendInt(b []byte, n int64) []byte {
+	return appendPrefix(b, ':', n)
+}
+
+func AppendArray(b []byte, n int) []byte {
+	return appendPrefix(b, '*', int64(n))
+}
+
+func AppendBulk(b []byte, bulk []byte) []byte {
+	b = appendPrefix(b, '$', int64(len(bulk)))
+	b = append(b, bulk...)
+	return append(b, '\r', '\n')
+}
+
+func AppendBulkString(b []byte, bulk string) []byte {
+	b = appendPrefix(b, '$', int64(len(bulk)))
+	b = append(b, bulk...)
+	return append(b, '\r', '\n')
+}
+
+func AppendString(b []byte, s string) []byte {
+	b = append(b, '+')
+	b = append(b, stripNewlines(s)...)
+	return append(b, '\r', '\n')
+}
+
+func AppendError(b []byte, s string) []byte {
+	b = append(b, '-')
+	b = append(b, stripNewlines(s)...)
+	return append(b, '\r', '\n')
+}
+
+func AppendOK(b []byte) []byte {
+	return append(b, '+', 'O', 'K', '\r', '\n')
+}
+func stripNewlines(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\r' || s[i] == '\n' {
+			s = strings.Replace(s, "\r", " ", -1)
+			s = strings.Replace(s, "\n", " ", -1)
+			break
+		}
+	}
+	return s
+}
+
+func AppendTile38(b []byte, data []byte) []byte {
+	b = append(b, '$')
+	b = strconv.AppendInt(b, int64(len(data)), 10)
+	b = append(b, ' ')
+	b = append(b, data...)
+	return append(b, '\r', '\n')
+}
+
+func AppendNull(b []byte) []byte {
+	return append(b, '$', '-', '1', '\r', '\n')
+}
+
+func AppendBulkFloat(dst []byte, f float64) []byte {
+	return AppendBulk(dst, strconv.AppendFloat(nil, f, 'f', -1, 64))
+}
+
+func AppendBulkInt(dst []byte, x int64) []byte {
+	return AppendBulk(dst, strconv.AppendInt(nil, x, 10))
+}
+
+func AppendBulkUint(dst []byte, x uint64) []byte {
+	return AppendBulk(dst, strconv.AppendUint(nil, x, 10))
+}
+
+func prefixERRIfNeeded(msg string) string {
+	msg = strings.TrimSpace(msg)
+	firstWord := strings.Split(msg, " ")[0]
+	addERR := len(firstWord) == 0
+	for i := 0; i < len(firstWord); i++ {
+		if firstWord[i] < 'A' || firstWord[i] > 'Z' {
+			addERR = true
+			break
+		}
+	}
+	if addERR {
+		msg = strings.TrimSpace("ERR " + msg)
+	}
+	return msg
+}
+
+type SimpleString string
+type SimpleInt int
+type SimpleError error
+type Marshaler interface {
+	MarshalRESP() []byte
+}
+
+func AppendAny(b []byte, v interface{}) []byte {
+	switch v := v.(type) {
+	case SimpleString:
+		b = AppendString(b, string(v))
+	case SimpleInt:
+		b = AppendInt(b, int64(v))
+	case SimpleError:
+		b = AppendError(b, v.Error())
+	case nil:
+		b = AppendNull(b)
+	case error:
+		b = AppendError(b, prefixERRIfNeeded(v.Error()))
+	case string:
+		b = AppendBulkString(b, v)
+	case []byte:
+		b = AppendBulk(b, v)
+	case bool:
+		if v {
+			b = AppendBulkString(b, "1")
+		} else {
+			b = AppendBulkString(b, "0")
+		}
+	case int:
+		b = AppendBulkInt(b, int64(v))
+	case int8:
+		b = AppendBulkInt(b, int64(v))
+	case int16:
+		b = AppendBulkInt(b, int64(v))
+	case int32:
+		b = AppendBulkInt(b, int64(v))
+	case int64:
+		b = AppendBulkInt(b, int64(v))
+	case uint:
+		b = AppendBulkUint(b, uint64(v))
+	case uint8:
+		b = AppendBulkUint(b, uint64(v))
+	case uint16:
+		b = AppendBulkUint(b, uint64(v))
+	case uint32:
+		b = AppendBulkUint(b, uint64(v))
+	case uint64:
+		b = AppendBulkUint(b, uint64(v))
+	case float32:
+		b = AppendBulkFloat(b, float64(v))
+	case float64:
+		b = AppendBulkFloat(b, float64(v))
+	case Marshaler:
+		b = append(b, v.MarshalRESP()...)
+	default:
+		vv := reflect.ValueOf(v)
+		switch vv.Kind() {
+		case reflect.Slice:
+			n := vv.Len()
+			b = AppendArray(b, n)
+			for i := 0; i < n; i++ {
+				b = AppendAny(b, vv.Index(i).Interface())
+			}
+		case reflect.Map:
+			n := vv.Len()
+			b = AppendArray(b, n*2)
+			var i int
+			var strKey bool
+			var strsKeyItems []strKeyItem
+
+			iter := vv.MapRange()
+			for iter.Next() {
+				key := iter.Key().Interface()
+				if i == 0 {
+					if _, ok := key.(string); ok {
+						strKey = true
+						strsKeyItems = make([]strKeyItem, n)
+					}
+				}
+				if strKey {
+					strsKeyItems[i] = strKeyItem{
+						key.(string), iter.Value().Interface(),
+					}
+				} else {
+					b = AppendAny(b, key)
+					b = AppendAny(b, iter.Value().Interface())
+				}
+				i++
+			}
+			if strKey {
+				sort.Slice(strsKeyItems, func(i, j int) bool {
+					return strsKeyItems[i].key < strsKeyItems[j].key
+				})
+				for _, item := range strsKeyItems {
+					b = AppendBulkString(b, item.key)
+					b = AppendAny(b, item.value)
+				}
+			}
+		default:
+			b = AppendBulkString(b, fmt.Sprint(v))
+		}
+	}
+	return b
+}
+
+type strKeyItem struct {
+	key   string
+	value interface{}
+}
